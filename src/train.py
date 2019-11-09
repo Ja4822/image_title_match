@@ -22,19 +22,19 @@ LEARNING_RATE = 5e-5
 MODEL_PATH = '../model/fine_tuned_model/'
 RESNET_CKPT = '../model/resnet/resnet_v1_50.ckpt'
 CHECKPOINT_EXCLUDE_SCOPES = 'Logits'
-IMG_SIZE = 64
+IMG_SIZE = 32
 
 # data
 DATA_PATH  = '../data/sorted_titles.csv'
 IMG_PATH = '../data/sorted/'
 
 # 训练参数
-EPOCH = 100
+EPOCH = 10
 IS_TRAINING = True
 BATCH_SIZE = 16
 NUM_LABELS = 2
 FC_SIZE = 2000
-TEST_PERCENTAGE = 0.2
+TEST_PERCENTAGE = 0.4
 
 def create_text_input():
     data = pd.read_csv(DATA_PATH)
@@ -85,7 +85,7 @@ def create_image_input():
 
 def create_train_test_samples(ids, masks, segmensts, images):
     # 将imgs分为正负样本，正样本不打乱，负样本打乱顺序
-    pos_imgs, neg_imgs = train_test_split(images, train_size=0.1, test_size=0.9, shuffle=False)
+    pos_imgs, neg_imgs = train_test_split(images, train_size=0.5, test_size=0.5, shuffle=False)
     print('[INFO] pos samples, neg samples = (%d, %d)'%(len(pos_imgs), len(neg_imgs)))
     # 生成正负样本的labels
     pos_labels = [1]*len(pos_imgs)
@@ -214,31 +214,44 @@ if __name__ == "__main__":
 
 
         logits = tf.squeeze(logits, axis=[1, 2])
-        resnet_fc = slim.fully_connected(logits, num_outputs=bert_hidden_size, activation_fn=None,
-                    weights_initializer=tf.initializers.variance_scaling(), scope='resnet_fc')
+        # resnet_fc = slim.fully_connected(logits, num_outputs=bert_hidden_size, activation_fn=None,
+        #             weights_initializer=tf.initializers.variance_scaling(), scope='resnet_fc')
 
     print('================== Building mixed model =====================')
     with tf.variable_scope('mixed_model'):
         ### resnet输出的向量维度和bert的维度不同，先过一层dense，再拼接
-        ### model: bert_output_layer + resnet_fc --> model_concat_layer --> model_fc_layer --> softmax
-        model_concat_layer = tf.concat([bert_output_layer, resnet_fc], -1)
-        model_fc_layer = slim.fully_connected(model_concat_layer, num_outputs=NUM_LABELS,
-                    weights_initializer=tf.initializers.variance_scaling(), scope='resnet_fc')
+        ### model: bert_output_layer + resnet_fc --> model_concat_layer
+        ### bn --> dense --> dropout
+        model_concat_layer = tf.concat([bert_output_layer, logits], -1)
+        model_bn_layer = slim.batch_norm(model_concat_layer, decay=0.9, 
+                    zero_debias_moving_mean=True, is_training=IS_TRAINING, scope='model_bn1')
+        model_fc_layer = slim.fully_connected(model_bn_layer, num_outputs=FC_SIZE,
+                    weights_initializer=tf.initializers.variance_scaling(), scope='model_fc1')
+        model_dropout = slim.dropout(model_fc_layer, is_training=IS_TRAINING, scope='model_dropout1')
+        # ### bn --> dense --> dropout
+        # model_bn_layer = slim.batch_norm(model_dropout, decay=0.9, 
+        #             zero_debias_moving_mean=True, is_training=IS_TRAINING, scope='model_bn2')
+        # model_fc_layer = slim.fully_connected(model_bn_layer, num_outputs=FC_SIZE,
+        #             weights_initializer=tf.initializers.variance_scaling(), scope='model_fc2')
+        # model_dropout = slim.dropout(model_fc_layer, is_training=IS_TRAINING, scope='model_dropout2')
+        ### dense --> softmax
+        model_fc_layer = slim.fully_connected(model_dropout, num_outputs=NUM_LABELS, activation_fn=None, 
+                    weights_initializer=tf.initializers.variance_scaling(), scope='model_fc3')
         model_logits = slim.softmax(model_fc_layer, scope='softmax')
         tf.add_to_collection("predict", model_logits)
-        update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
 
     with tf.variable_scope('loss'):
         
-        tf.losses.softmax_cross_entropy(input_labels, model_logits, weights=1.0)
-        loss = tf.losses.get_total_loss()
+        loss = tf.losses.softmax_cross_entropy(input_labels, model_logits, weights=1.0)
+        # loss = tf.losses.get_total_loss()
+        update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
         with tf.control_dependencies(update_ops):
             # 参考AdamOptimizer源码确定参数
-            train_op = tf.train.AdamOptimizer(learning_rate=LEARNING_RATE, epsilon=1e-4).minimize(loss)
+            train_op = tf.train.AdamOptimizer(learning_rate=LEARNING_RATE).minimize(loss)
 
     with tf.variable_scope('accuracy'):
-        predict = tf.argmax(logits, 1)
-        correct_prediction = tf.equal(tf.argmax(logits, 1), tf.argmax(input_labels, 1))
+        predict = tf.argmax(model_logits, 1)
+        correct_prediction = tf.equal(tf.argmax(model_logits, 1), tf.argmax(input_labels, 1))
         accuracy = tf.reduce_mean(tf.cast(correct_prediction, tf.float32))
 
     with tf.variable_scope('summaty'):
@@ -288,13 +301,17 @@ if __name__ == "__main__":
             train_acc_list = []
             for i in range(num_iteration_train):
                 batch_ids, batch_masks, batch_segments, batch_images, batch_labels = sess.run(train_batch_data)
-                train_loss, train_acc, _ = sess.run([loss, accuracy, train_op],
+                # print(batch_labels[0])
+                train_loss, train_acc, _ , prediction = sess.run([loss, accuracy, train_op, model_logits],
                     feed_dict={input_ids:batch_ids, input_mask:batch_masks, segment_ids:batch_segments,
                         input_images:batch_images, input_labels:batch_labels})
                 train_loss_list.append(train_loss)
                 train_acc_list.append(train_acc)
-                print('Epoch %d/%d, batch %d/%d, tr_loss = %.3f, tr_acc = %.3f'\
-                    %(epoch+1, EPOCH, i+1, num_iteration_train, train_loss, train_acc))
+                if i % 20 == 0 or i+1 == num_iteration_train:
+                    # print(batch_labels[:10])
+                    # print(prediction[:10])
+                    print('Epoch %d/%d, batch %d/%d, tr_loss = %.3f, tr_acc = %.3f'\
+                        %(epoch+1, EPOCH, i+1, num_iteration_train, train_loss, train_acc))
             # 每次训练对整个test进行测试
             test_loss_list = []
             test_acc_list = []
